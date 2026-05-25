@@ -1,19 +1,9 @@
-from .core import (
-    PersonaNotFound,
-    Persona,
-    PersonaRegistry,
-    register,
-    get,
-    apply,
-    system_prompt,
-)
+"""llm_persona — named persona registry for LLM agents."""
+
+from .core import Persona, PersonaNotFoundError, PersonaRegistry
 
 __all__ = [
-    "PersonaNotFound",
     "Persona",
+    "PersonaNotFoundError",
     "PersonaRegistry",
-    "register",
-    "get",
-    "apply",
-    "system_prompt",
 ]
