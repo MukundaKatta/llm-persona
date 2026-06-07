@@ -2,6 +2,10 @@
 
 Define reusable :class:`Persona` objects with system prompts, tags, and
 metadata, then look them up by name via :class:`PersonaRegistry`.
+Personas can also carry request parameters (model, temperature, and arbitrary
+extra keyword arguments) and produce ready-to-send request payloads via
+:meth:`Persona.apply` / :meth:`PersonaRegistry.apply`.
+
 Zero dependencies.
 """
 
@@ -11,6 +15,9 @@ import copy
 from dataclasses import dataclass, field
 from typing import Any
 
+# A chat message is a plain dict, e.g. ``{"role": "user", "content": "hi"}``.
+Message = dict[str, Any]
+
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -19,6 +26,11 @@ from typing import Any
 
 class PersonaNotFoundError(KeyError):
     """Raised when a persona name is not in the registry."""
+
+
+# Backwards/alternate-friendly alias. Both names refer to the same class so
+# ``except PersonaNotFound`` and ``except PersonaNotFoundError`` both work.
+PersonaNotFound = PersonaNotFoundError
 
 
 # ---------------------------------------------------------------------------
@@ -35,7 +47,11 @@ class Persona:
         system_prompt: The system prompt text. Must not be empty.
         description: Optional human-readable description.
         tags: Sequence of string tags (stored as a tuple).
-        metadata: Arbitrary extra key/value pairs.
+        metadata: Arbitrary extra key/value pairs (informational only).
+        model: Optional default model id for requests built from this persona.
+        temperature: Optional default sampling temperature.
+        extra: Optional extra request parameters merged into payloads built by
+            :meth:`apply` (for example ``{"max_tokens": 1024}``).
 
     Raises:
         ValueError: If *name* or *system_prompt* is empty.
@@ -46,6 +62,9 @@ class Persona:
     description: str = ""
     tags: tuple[str, ...] = field(default_factory=tuple)
     metadata: dict[str, Any] = field(default_factory=dict)
+    model: str | None = None
+    temperature: float | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -54,8 +73,9 @@ class Persona:
             raise ValueError("system_prompt must not be empty")
         # Normalise tags to tuple regardless of input type
         object.__setattr__(self, "tags", tuple(self.tags))
-        # Deep-copy metadata so callers can't mutate our internals
+        # Deep-copy mutable inputs so callers can't mutate our internals
         object.__setattr__(self, "metadata", copy.deepcopy(self.metadata))
+        object.__setattr__(self, "extra", copy.deepcopy(self.extra))
 
     # ------------------------------------------------------------------
     # Queries
@@ -68,6 +88,60 @@ class Persona:
             ``{"role": "system", "content": <system_prompt>}``
         """
         return {"role": "system", "content": self.system_prompt}
+
+    # Alias for callers that prefer the more explicit name.
+    as_system_message = as_message
+
+    def inject_system(self, messages: list[Message]) -> list[Message]:
+        """Return a *new* message list with this persona's system message first.
+
+        The input list is never mutated.
+
+        Args:
+            messages: Existing chat messages (OpenAI-style role/content dicts).
+
+        Returns:
+            A new list: ``[system_message, *messages]``.
+        """
+        return [self.as_message(), *messages]
+
+    def apply(
+        self,
+        messages: list[Message],
+        *,
+        include_model: bool = True,
+    ) -> dict[str, Any]:
+        """Build a request-kwargs dict for this persona.
+
+        The returned dict is suitable for splatting into an LLM client call,
+        e.g. ``client.messages.create(**persona.apply(messages))``. It uses the
+        Anthropic-style ``system`` parameter (a top-level string) rather than a
+        system message embedded in ``messages``.
+
+        Keys are populated as follows:
+
+        * ``system`` — always the persona's :attr:`system_prompt`.
+        * ``messages`` — the *messages* argument, unchanged.
+        * ``model`` — included only if set and *include_model* is true.
+        * ``temperature`` — included only if set (not ``None``).
+        * any keys from :attr:`extra` are merged in.
+
+        Args:
+            messages: The chat messages to send.
+            include_model: When ``False``, omit ``model`` even if the persona
+                defines one (useful when the caller pins the model elsewhere).
+
+        Returns:
+            A new dict of request keyword arguments.
+        """
+        payload: dict[str, Any] = dict(self.extra)
+        payload["system"] = self.system_prompt
+        payload["messages"] = messages
+        if self.model is not None and include_model:
+            payload["model"] = self.model
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
+        return payload
 
     # ------------------------------------------------------------------
     # Builders (return new Persona)
@@ -91,6 +165,9 @@ class Persona:
             description=self.description,
             tags=self.tags,
             metadata=merged,
+            model=self.model,
+            temperature=self.temperature,
+            extra=self.extra,
         )
 
     def with_tags(self, *tags: str) -> "Persona":
@@ -113,7 +190,10 @@ class Persona:
             system_prompt=self.system_prompt,
             description=self.description,
             tags=tuple(combined),
-            metadata=copy.deepcopy(self.metadata),
+            metadata=self.metadata,
+            model=self.model,
+            temperature=self.temperature,
+            extra=self.extra,
         )
 
     # ------------------------------------------------------------------
@@ -125,6 +205,9 @@ class Persona:
             f"Persona(name={self.name!r}, "
             f"system_prompt={self.system_prompt!r})"
         )
+
+    def __str__(self) -> str:
+        return f"Persona<{self.name}>"
 
 
 # ---------------------------------------------------------------------------
@@ -139,8 +222,8 @@ class PersonaRegistry:
 
         registry = PersonaRegistry()
         registry.register("helper", "You are a helpful assistant.")
-        p = registry.require("helper")
-        kwargs = p.as_message()
+        kwargs = registry.apply("helper", messages)
+        # response = client.messages.create(**kwargs)
     """
 
     def __init__(self) -> None:
@@ -158,26 +241,34 @@ class PersonaRegistry:
         description: str = "",
         tags: list[str] | tuple[str, ...] = (),
         metadata: dict[str, Any] | None = None,
+        model: str | None = None,
+        temperature: float | None = None,
+        **extra: Any,
     ) -> "PersonaRegistry":
         """Register a persona.
 
         Accepts either a :class:`Persona` object or a ``(name, system_prompt)``
-        shorthand.
+        shorthand. With the shorthand form, any unknown keyword arguments are
+        collected into the persona's :attr:`Persona.extra` request parameters
+        (for example ``register("p", "X", max_tokens=512)``).
 
         Args:
             persona_or_name: A :class:`Persona` instance, or the persona name
-                             string when using the shorthand form.
+                string when using the shorthand form.
             system_prompt: Required when *persona_or_name* is a string.
             description: Optional description (shorthand form only).
             tags: Optional tags (shorthand form only).
             metadata: Optional metadata dict (shorthand form only).
+            model: Optional default model id (shorthand form only).
+            temperature: Optional default temperature (shorthand form only).
+            **extra: Extra request parameters (shorthand form only).
 
         Returns:
             ``self`` for chaining.
 
         Raises:
             ValueError: If a persona with the same name is already registered,
-                        or if using the shorthand form without a system_prompt.
+                or if using the shorthand form without a system_prompt.
         """
         if isinstance(persona_or_name, Persona):
             p = persona_or_name
@@ -192,6 +283,9 @@ class PersonaRegistry:
                 description=description,
                 tags=tuple(tags),
                 metadata=metadata or {},
+                model=model,
+                temperature=temperature,
+                extra=extra,
             )
         if p.name in self._store:
             raise ValueError(
@@ -215,6 +309,20 @@ class PersonaRegistry:
         if name not in self._store:
             raise PersonaNotFoundError(name)
         del self._store[name]
+        return self
+
+    def remove(self, name: str) -> "PersonaRegistry":
+        """Remove a persona by name if present; a no-op when it is not.
+
+        Unlike :meth:`unregister`, this never raises for a missing name.
+
+        Args:
+            name: Persona name to remove.
+
+        Returns:
+            ``self`` for chaining.
+        """
+        self._store.pop(name, None)
         return self
 
     def update(self, persona: Persona) -> "PersonaRegistry":
@@ -266,6 +374,18 @@ class PersonaRegistry:
         """
         return self._store.get(name, default)
 
+    # ``get_or_none`` is an explicit alias of ``get`` (default ``None``).
+    def get_or_none(self, name: str) -> "Persona | None":
+        """Return a persona by name, or ``None`` if not found.
+
+        Args:
+            name: Persona name.
+
+        Returns:
+            The :class:`Persona` or ``None``.
+        """
+        return self._store.get(name)
+
     def require(self, name: str) -> Persona:
         """Return a persona by name, raising if not found.
 
@@ -313,6 +433,44 @@ class PersonaRegistry:
         """Return all personas sorted by name."""
         return [self._store[n] for n in sorted(self._store)]
 
+    def system_prompt(self, name: str) -> str:
+        """Return the system prompt for *name*, raising if not found.
+
+        Args:
+            name: Persona name.
+
+        Returns:
+            The persona's system prompt string.
+
+        Raises:
+            PersonaNotFoundError: If *name* is not registered.
+        """
+        return self.require(name).system_prompt
+
+    def apply(
+        self,
+        name: str,
+        messages: list[Message],
+        *,
+        include_model: bool = True,
+    ) -> dict[str, Any]:
+        """Build request kwargs for the named persona.
+
+        Equivalent to ``registry.require(name).apply(messages, ...)``.
+
+        Args:
+            name: Persona name.
+            messages: The chat messages to send.
+            include_model: When ``False``, omit ``model`` even if set.
+
+        Returns:
+            A new dict of request keyword arguments.
+
+        Raises:
+            PersonaNotFoundError: If *name* is not registered.
+        """
+        return self.require(name).apply(messages, include_model=include_model)
+
     # ------------------------------------------------------------------
     # Properties / dunders
     # ------------------------------------------------------------------
@@ -333,5 +491,74 @@ class PersonaRegistry:
     def __contains__(self, name: object) -> bool:
         return name in self._store
 
+    def __getitem__(self, name: str) -> Persona:
+        """Return a persona by name, raising :class:`PersonaNotFoundError`."""
+        return self.require(name)
+
+    def __iter__(self):
+        """Iterate over personas in sorted-name order."""
+        return iter(self.all_personas())
+
     def __repr__(self) -> str:
         return f"PersonaRegistry(count={self.count})"
+
+
+# ---------------------------------------------------------------------------
+# Module-level convenience API (a shared default registry)
+# ---------------------------------------------------------------------------
+
+#: A process-wide default registry used by the module-level helpers below.
+default_registry = PersonaRegistry()
+
+
+def register(
+    name: str,
+    system_prompt: str,
+    **kwargs: Any,
+) -> Persona:
+    """Register a persona on the shared :data:`default_registry`.
+
+    Args:
+        name: Persona name.
+        system_prompt: The system prompt text.
+        **kwargs: Forwarded to :meth:`PersonaRegistry.register` (description,
+            tags, metadata, model, temperature, and extra request params).
+
+    Returns:
+        The newly registered :class:`Persona`.
+    """
+    default_registry.register(name, system_prompt, **kwargs)
+    return default_registry.require(name)
+
+
+def get(name: str) -> Persona:
+    """Return a persona from the shared :data:`default_registry`.
+
+    Args:
+        name: Persona name.
+
+    Returns:
+        The registered :class:`Persona`.
+
+    Raises:
+        PersonaNotFoundError: If *name* is not registered.
+    """
+    return default_registry.require(name)
+
+
+def apply(
+    name: str,
+    messages: list[Message],
+    *,
+    include_model: bool = True,
+) -> dict[str, Any]:
+    """Build request kwargs from a persona in the shared registry.
+
+    See :meth:`PersonaRegistry.apply`.
+    """
+    return default_registry.apply(name, messages, include_model=include_model)
+
+
+def system_prompt(name: str) -> str:
+    """Return the system prompt for a persona in the shared registry."""
+    return default_registry.system_prompt(name)
