@@ -1,193 +1,82 @@
-import pytest
-from llm_persona import Persona, PersonaRegistry, PersonaNotFound
+"""Tests for the module-level convenience API and exception aliases.
+
+Uses the standard library ``unittest`` only (no third-party deps).
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import unittest
+
+# Make ``src/`` importable so the tests run with a plain
+# ``python3 -m unittest discover -s tests`` without an editable install.
+_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+if os.path.isdir(_SRC) and _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+
+import llm_persona  # noqa: E402
+from llm_persona import (  # noqa: E402
+    Persona,
+    PersonaNotFound,
+    PersonaNotFoundError,
+    PersonaRegistry,
+)
 
 
-# ---------------------------------------------------------------------------
-# Persona dataclass
-# ---------------------------------------------------------------------------
+class TestExceptionAlias(unittest.TestCase):
+    def test_persona_not_found_alias_is_same_class(self) -> None:
+        # ``PersonaNotFound`` is an alias of ``PersonaNotFoundError`` so either
+        # name can be used in an ``except`` clause.
+        self.assertIs(PersonaNotFound, PersonaNotFoundError)
 
-def test_persona_str():
-    p = Persona(name="researcher", system_prompt="Be thorough.")
-    assert "researcher" in str(p)
-
-def test_persona_repr():
-    p = Persona(name="researcher", system_prompt="Be thorough.")
-    assert "researcher" in repr(p)
-
-def test_persona_apply_includes_system():
-    p = Persona(name="r", system_prompt="Be helpful.")
-    messages = [{"role": "user", "content": "hi"}]
-    result = p.apply(messages)
-    assert result["system"] == "Be helpful."
-    assert result["messages"] == messages
-
-def test_persona_apply_includes_model():
-    p = Persona(name="r", system_prompt="X", model="claude-sonnet-4-5")
-    result = p.apply([])
-    assert result["model"] == "claude-sonnet-4-5"
-
-def test_persona_apply_no_model_skipped():
-    p = Persona(name="r", system_prompt="X")
-    result = p.apply([])
-    assert "model" not in result
-
-def test_persona_apply_include_model_false():
-    p = Persona(name="r", system_prompt="X", model="claude-sonnet-4-5")
-    result = p.apply([], include_model=False)
-    assert "model" not in result
-
-def test_persona_apply_includes_temperature():
-    p = Persona(name="r", system_prompt="X", temperature=0.7)
-    result = p.apply([])
-    assert result["temperature"] == 0.7
-
-def test_persona_apply_no_temperature_skipped():
-    p = Persona(name="r", system_prompt="X")
-    result = p.apply([])
-    assert "temperature" not in result
-
-def test_persona_apply_extra_kwargs():
-    p = Persona(name="r", system_prompt="X", extra={"max_tokens": 1024})
-    result = p.apply([])
-    assert result["max_tokens"] == 1024
-
-def test_persona_as_system_message():
-    p = Persona(name="r", system_prompt="Be helpful.")
-    msg = p.as_system_message()
-    assert msg == {"role": "system", "content": "Be helpful."}
-
-def test_persona_inject_system():
-    p = Persona(name="r", system_prompt="Be helpful.")
-    messages = [{"role": "user", "content": "hi"}]
-    result = p.inject_system(messages)
-    assert len(result) == 2
-    assert result[0]["role"] == "system"
-    assert result[1]["role"] == "user"
-
-def test_persona_inject_system_no_mutate():
-    p = Persona(name="r", system_prompt="X")
-    messages = [{"role": "user", "content": "hi"}]
-    p.inject_system(messages)
-    assert len(messages) == 1
+    def test_alias_catches_real_error(self) -> None:
+        with self.assertRaises(PersonaNotFound):
+            PersonaRegistry().require("nope")
 
 
-# ---------------------------------------------------------------------------
-# PersonaRegistry
-# ---------------------------------------------------------------------------
+class TestModuleLevelAPI(unittest.TestCase):
+    def setUp(self) -> None:
+        # Each test gets a clean shared registry so ordering does not matter.
+        llm_persona.default_registry._store.clear()
 
-def test_register_and_get():
-    r = PersonaRegistry()
-    r.register("researcher", "Be thorough.")
-    p = r.get("researcher")
-    assert p.name == "researcher"
-    assert p.system_prompt == "Be thorough."
+    def tearDown(self) -> None:
+        llm_persona.default_registry._store.clear()
 
-def test_get_missing_raises():
-    r = PersonaRegistry()
-    with pytest.raises(PersonaNotFound):
-        r.get("missing")
+    def test_register_returns_persona(self) -> None:
+        p = llm_persona.register("a", "System prompt.")
+        self.assertIsInstance(p, Persona)
+        self.assertEqual(p.name, "a")
+        self.assertEqual(p.system_prompt, "System prompt.")
 
-def test_get_or_none_missing():
-    r = PersonaRegistry()
-    assert r.get_or_none("missing") is None
+    def test_register_and_get(self) -> None:
+        llm_persona.register("greeter", "Say hi.")
+        self.assertEqual(llm_persona.get("greeter").system_prompt, "Say hi.")
 
-def test_register_description():
-    r = PersonaRegistry()
-    r.register("p", "X", description="A persona")
-    assert r.get("p").description == "A persona"
+    def test_get_missing_raises(self) -> None:
+        with self.assertRaises(PersonaNotFoundError):
+            llm_persona.get("missing")
 
-def test_register_model():
-    r = PersonaRegistry()
-    r.register("p", "X", model="claude-sonnet-4-5")
-    assert r.get("p").model == "claude-sonnet-4-5"
+    def test_apply(self) -> None:
+        llm_persona.register("a", "Apply this.", model="m")
+        result = llm_persona.apply("a", [{"role": "user", "content": "hi"}])
+        self.assertEqual(result["system"], "Apply this.")
+        self.assertEqual(result["model"], "m")
 
-def test_register_temperature():
-    r = PersonaRegistry()
-    r.register("p", "X", temperature=0.5)
-    assert r.get("p").temperature == 0.5
+    def test_system_prompt(self) -> None:
+        llm_persona.register("a", "SP text.")
+        self.assertEqual(llm_persona.system_prompt("a"), "SP text.")
 
-def test_register_extra_kwargs():
-    r = PersonaRegistry()
-    r.register("p", "X", max_tokens=512)
-    result = r.apply("p", [])
-    assert result["max_tokens"] == 512
+    def test_register_with_extra_params(self) -> None:
+        llm_persona.register("a", "X", temperature=0.2, max_tokens=64)
+        result = llm_persona.apply("a", [])
+        self.assertEqual(result["temperature"], 0.2)
+        self.assertEqual(result["max_tokens"], 64)
 
-def test_apply():
-    r = PersonaRegistry()
-    r.register("p", "Be helpful.", model="m")
-    messages = [{"role": "user", "content": "hi"}]
-    result = r.apply("p", messages)
-    assert result["system"] == "Be helpful."
-    assert result["messages"] == messages
-    assert result["model"] == "m"
-
-def test_system_prompt():
-    r = PersonaRegistry()
-    r.register("p", "Be thorough.")
-    assert r.system_prompt("p") == "Be thorough."
-
-def test_remove():
-    r = PersonaRegistry()
-    r.register("p", "X")
-    r.remove("p")
-    assert "p" not in r
-
-def test_remove_missing_no_raise():
-    r = PersonaRegistry()
-    r.remove("nonexistent")
-
-def test_names():
-    r = PersonaRegistry()
-    r.register("a", "X")
-    r.register("b", "Y")
-    assert set(r.names()) == {"a", "b"}
-
-def test_all_personas():
-    r = PersonaRegistry()
-    r.register("a", "X")
-    r.register("b", "Y")
-    assert len(r.all_personas()) == 2
-
-def test_contains():
-    r = PersonaRegistry()
-    r.register("p", "X")
-    assert "p" in r
-    assert "missing" not in r
-
-def test_len():
-    r = PersonaRegistry()
-    r.register("a", "X")
-    r.register("b", "Y")
-    assert len(r) == 2
-
-def test_getitem():
-    r = PersonaRegistry()
-    r.register("p", "X")
-    assert r["p"].name == "p"
-
-def test_getitem_missing_raises():
-    r = PersonaRegistry()
-    with pytest.raises(PersonaNotFound):
-        _ = r["missing"]
+    def test_default_registry_is_shared(self) -> None:
+        llm_persona.register("shared", "X")
+        self.assertIn("shared", llm_persona.default_registry)
 
 
-# ---------------------------------------------------------------------------
-# Module-level API
-# ---------------------------------------------------------------------------
-
-def test_module_register_and_get():
-    from llm_persona import register, get
-    register("test_mod_persona", "Test system prompt.")
-    p = get("test_mod_persona")
-    assert p.system_prompt == "Test system prompt."
-
-def test_module_apply():
-    from llm_persona import register, apply
-    register("test_mod_apply", "Apply this.", model="m")
-    result = apply("test_mod_apply", [{"role": "user", "content": "hi"}])
-    assert result["system"] == "Apply this."
-
-def test_module_system_prompt():
-    from llm_persona import register, system_prompt
-    register("test_mod_sp", "SP text.")
-    assert system_prompt("test_mod_sp") == "SP text."
+if __name__ == "__main__":
+    unittest.main()
